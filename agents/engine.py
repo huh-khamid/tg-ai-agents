@@ -1,6 +1,5 @@
 """
-Движок агента: общается с Groq API,
-вызывает инструменты, хранит историю диалога.
+Движок агента: вызывает Groq API напрямую через aiohttp (без SDK).
 При превышении лимита автоматически переключается на следующую модель.
 """
 
@@ -9,28 +8,29 @@ import json
 import logging
 from typing import Optional
 
-from groq import AsyncGroq, RateLimitError, APIStatusError
+import aiohttp
 
 from agents.definitions import AgentDefinition, AGENTS
 from tools.tools import TOOLS_REGISTRY
 
 logger = logging.getLogger(__name__)
 
-# ─── Цепочка фоллбэк-моделей (Groq) ─────────────────────────────────────────
-# Бесплатно, быстро, без карты — просто зарегистрируйся на console.groq.com
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# ─── Цепочка фоллбэк-моделей ─────────────────────────────────────────────────
 
 FALLBACK_MODELS = [
-    "llama-3.3-70b-versatile",   # 1. Llama 3.3 70B (основная, мощная)
-    "llama-3.1-70b-versatile",   # 2. Llama 3.1 70B (запасная)
-    "mixtral-8x7b-32768",        # 3. Mixtral 8x7B (большой контекст)
-    "llama-3.1-8b-instant",      # 4. Llama 3.1 8B (быстрая)
-    "gemma2-9b-it",              # 5. Gemma 2 9B (резервная)
+    "llama-3.3-70b-versatile",  # 1. Llama 3.3 70B (основная)
+    "llama-3.1-70b-versatile",  # 2. Llama 3.1 70B
+    "mixtral-8x7b-32768",       # 3. Mixtral 8x7B
+    "llama-3.1-8b-instant",     # 4. Llama 8B (быстрая)
+    "gemma2-9b-it",             # 5. Gemma 2 9B (резервная)
 ]
 
 DEFAULT_MODEL = FALLBACK_MODELS[0]
 
 
-# ─── Схемы инструментов (OpenAI-совместимый формат) ──────────────────────────
+# ─── Схемы инструментов ───────────────────────────────────────────────────────
 
 TOOL_SCHEMAS = [
     {
@@ -130,14 +130,13 @@ class AgentEngine:
 
     def __init__(self, definition: AgentDefinition, api_key: str, model: str = DEFAULT_MODEL):
         self.definition = definition
-        self.client = AsyncGroq(api_key=api_key)
+        self.api_key = api_key
         self.tools = get_tools_for_agent(definition.tools)
         self.history: list[dict] = [
             {"role": "system", "content": definition.system_prompt}
         ]
         self._max_tool_calls = 8
 
-        # Строим цепочку фоллбэка начиная с выбранной модели
         if model in FALLBACK_MODELS:
             start = FALLBACK_MODELS.index(model)
             self._model_chain = FALLBACK_MODELS[start:] + FALLBACK_MODELS[:start]
@@ -169,6 +168,66 @@ class AgentEngine:
         except Exception as e:
             return f"❌ Ошибка инструмента {name}: {e}"
 
+    async def _groq_request(self, model: str) -> dict:
+        """Делает запрос к Groq API через aiohttp."""
+        payload = {
+            "model": model,
+            "messages": self.history,
+        }
+        if self.tools:
+            payload["tools"] = self.tools
+            payload["tool_choice"] = "auto"
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                GROQ_API_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                data = await resp.json()
+                if resp.status != 200:
+                    status = resp.status
+                    msg = data.get("error", {}).get("message", str(data))
+                    raise RuntimeError(f"HTTP {status}: {msg}")
+                return data
+
+    async def _run_with_tools(self, model: str) -> str:
+        """Один цикл запрос → инструменты → ответ."""
+        for _ in range(self._max_tool_calls):
+            data = await self._groq_request(model)
+            choice = data["choices"][0]
+            msg = choice["message"]
+
+            # Добавляем в историю
+            self.history.append(msg)
+
+            # Финальный ответ
+            if not msg.get("tool_calls"):
+                return msg.get("content") or "🤔 Агент не дал ответа."
+
+            # Выполняем инструменты
+            for tool_call in msg["tool_calls"]:
+                fn_name = tool_call["function"]["name"]
+                try:
+                    fn_args = json.loads(tool_call["function"]["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    fn_args = {}
+
+                result = await self._call_tool(fn_name, fn_args)
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": result,
+                })
+
+        return "⚠️ Агент достиг лимита вызовов инструментов."
+
     async def process(self, user_message: str) -> tuple[str, str]:
         """Обрабатывает сообщение, возвращает (ответ, модель)."""
         self.history.append({"role": "user", "content": user_message})
@@ -180,55 +239,19 @@ class AgentEngine:
                 result = await self._run_with_tools(model)
                 return result, model
 
-            except RateLimitError:
-                logger.warning(f"⚠️ Лимит модели {model}, переключаюсь...")
-                next_m = self._next_model()
-                if next_m is None:
-                    return "❌ Все модели достигли лимита. Попробуй позже.", model
-                self.history = self.history[:history_checkpoint + 1]
-
-            except APIStatusError as e:
-                if e.status_code in (404, 429, 503, 529):
-                    logger.warning(f"⚠️ Модель {model} недоступна (код {e.status_code}), переключаюсь...")
+            except RuntimeError as e:
+                err = str(e)
+                # Лимит или перегрузка — переключаемся
+                if any(code in err for code in ("HTTP 429", "HTTP 503", "HTTP 529", "HTTP 404", "rate_limit")):
+                    logger.warning(f"⚠️ Модель {model} недоступна: {err[:80]}, переключаюсь...")
                     next_m = self._next_model()
                     if next_m is None:
                         return "❌ Все модели недоступны. Попробуй позже.", model
                     self.history = self.history[:history_checkpoint + 1]
                 else:
-                    raise
+                    return f"❌ Ошибка: {err[:300]}", model
 
         return "❌ Не удалось получить ответ.", self.current_model
-
-    async def _run_with_tools(self, model: str) -> str:
-        """Один цикл запрос → инструменты → ответ."""
-        for _ in range(self._max_tool_calls):
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=self.history,
-                tools=self.tools if self.tools else None,
-                tool_choice="auto" if self.tools else None,
-            )
-            msg = response.choices[0].message
-            self.history.append(msg.model_dump(exclude_none=True))
-
-            if not msg.tool_calls:
-                return msg.content or "🤔 Агент не дал ответа."
-
-            for tool_call in msg.tool_calls:
-                fn_name = tool_call.function.name
-                try:
-                    fn_args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    fn_args = {}
-
-                result = await self._call_tool(fn_name, fn_args)
-                self.history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                })
-
-        return "⚠️ Агент достиг лимита вызовов инструментов."
 
     def reset(self):
         self.history = [{"role": "system", "content": self.definition.system_prompt}]
