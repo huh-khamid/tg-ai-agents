@@ -1,16 +1,31 @@
 """
 Движок агента: общается с OpenRouter (OpenAI-совместимый API),
 вызывает инструменты, хранит историю диалога.
+При превышении лимита автоматически переключается на следующую модель.
 """
 
 import asyncio
 import json
+import logging
 from typing import Optional
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError, APIStatusError
 
 from agents.definitions import AgentDefinition, AGENTS
 from tools.tools import TOOLS_REGISTRY
+
+logger = logging.getLogger(__name__)
+
+# ─── Цепочка фоллбэк-моделей ─────────────────────────────────────────────────
+# Если текущая модель упёрлась в лимит — автоматически берётся следующая
+
+FALLBACK_MODELS = [
+    "deepseek/deepseek-chat-v3-0324:free",   # 1. DeepSeek V3 (основная)
+    "meta-llama/llama-3.3-70b-instruct:free", # 2. Llama 3.3 70B
+    "deepseek/deepseek-r1:free",              # 3. DeepSeek R1
+    "google/gemini-flash-1.5:free",           # 4. Gemini Flash
+    "mistralai/mistral-7b-instruct:free",     # 5. Mistral 7B (запасной)
+]
 
 
 # ─── Схемы инструментов (OpenAI function calling формат) ──────────────────────
@@ -116,17 +131,38 @@ class AgentEngine:
 
     def __init__(self, definition: AgentDefinition, api_key: str, model: str = DEFAULT_MODEL):
         self.definition = definition
-        self.model = model
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
         )
         self.tools = get_tools_for_agent(definition.tools)
-        # История диалога
         self.history: list[dict] = [
             {"role": "system", "content": definition.system_prompt}
         ]
         self._max_tool_calls = 8
+
+        # Фоллбэк: строим цепочку начиная с выбранной модели
+        if model in FALLBACK_MODELS:
+            start = FALLBACK_MODELS.index(model)
+            self._model_chain = FALLBACK_MODELS[start:] + FALLBACK_MODELS[:start]
+        else:
+            # Пользовательская модель — ставим первой, потом стандартные
+            self._model_chain = [model] + FALLBACK_MODELS
+
+        self._model_index = 0  # индекс текущей активной модели
+
+    @property
+    def current_model(self) -> str:
+        return self._model_chain[self._model_index]
+
+    def _next_model(self) -> Optional[str]:
+        """Переключается на следующую модель. Возвращает None если все исчерпаны."""
+        self._model_index += 1
+        if self._model_index >= len(self._model_chain):
+            self._model_index = len(self._model_chain) - 1
+            return None
+        return self._model_chain[self._model_index]
+
 
     async def _call_tool(self, name: str, args: dict) -> str:
         """Вызывает инструмент по имени."""
@@ -141,27 +177,58 @@ class AgentEngine:
         except Exception as e:
             return f"❌ Ошибка инструмента {name}: {e}"
 
-    async def process(self, user_message: str) -> str:
-        """Обрабатывает сообщение и возвращает финальный ответ."""
+    async def process(self, user_message: str) -> tuple[str, str]:
+        """
+        Обрабатывает сообщение и возвращает (ответ, имя_использованной_модели).
+        При лимите автоматически переключается на следующую модель в цепочке.
+        """
         self.history.append({"role": "user", "content": user_message})
 
+        # Сохраняем точку отката истории (без последнего user-сообщения)
+        history_checkpoint = len(self.history) - 1
+
+        for attempt in range(len(self._model_chain)):
+            model = self.current_model
+            try:
+                result = await self._run_with_tools(model)
+                return result, model
+
+            except RateLimitError:
+                logger.warning(f"⚠️ Лимит модели {model}, переключаюсь...")
+                next_m = self._next_model()
+                if next_m is None:
+                    return "❌ Все модели достигли лимита. Попробуй позже.", model
+                # Откатываем историю до чекпоинта чтобы не дублировать сообщения
+                self.history = self.history[:history_checkpoint + 1]
+
+            except APIStatusError as e:
+                # 529 = overload на OpenRouter
+                if e.status_code in (429, 529, 503):
+                    logger.warning(f"⚠️ Перегрузка модели {model} (код {e.status_code}), переключаюсь...")
+                    next_m = self._next_model()
+                    if next_m is None:
+                        return "❌ Все модели перегружены. Попробуй чуть позже.", model
+                    self.history = self.history[:history_checkpoint + 1]
+                else:
+                    raise
+
+        return "❌ Не удалось получить ответ.", self.current_model
+
+    async def _run_with_tools(self, model: str) -> str:
+        """Выполняет один полный цикл запрос → инструменты → ответ."""
         for _ in range(self._max_tool_calls):
             response = await self.client.chat.completions.create(
-                model=self.model,
+                model=model,
                 messages=self.history,
                 tools=self.tools if self.tools else None,
                 tool_choice="auto" if self.tools else None,
             )
             msg = response.choices[0].message
-
-            # Добавляем ответ модели в историю
             self.history.append(msg.model_dump(exclude_none=True))
 
-            # Если нет tool_calls — финальный ответ
             if not msg.tool_calls:
                 return msg.content or "🤔 Агент не дал ответа."
 
-            # Выполняем все вызванные инструменты
             for tool_call in msg.tool_calls:
                 fn_name = tool_call.function.name
                 try:
@@ -170,7 +237,6 @@ class AgentEngine:
                     fn_args = {}
 
                 result = await self._call_tool(fn_name, fn_args)
-
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,

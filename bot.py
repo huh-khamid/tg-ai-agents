@@ -223,10 +223,16 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user_id} -> [{agent.name}]: {user_text[:80]}")
 
     try:
-        answer = await engine.process(user_text)
+        answer, used_model = await engine.process(user_text)
+
+        # Показываем уведомление если модель переключилась
+        primary_model = engine._model_chain[0]
+        model_note = ""
+        if used_model != primary_model:
+            model_note = f"\n\n_⚡ Модель переключена на: `{used_model}`_"
 
         header = f"{agent.emoji} *{agent.display_name}:*\n\n"
-        full = header + answer
+        full = header + answer + model_note
 
         if len(full) <= 4096:
             await update.message.reply_text(full, parse_mode=ParseMode.MARKDOWN)
