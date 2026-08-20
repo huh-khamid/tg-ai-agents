@@ -11,4 +11,6 @@ services:
         sync: false
       - key: OPENROUTER_MODEL
         value: deepseek/deepseek-chat-v3-0324:free
+      - key: PYTHON_VERSION
+        value: 3.12.7
     autoDeploy: true
