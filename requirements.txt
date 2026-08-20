@@ -1,5 +1,5 @@
 python-telegram-bot==21.6
-google-generativeai==0.8.3
+openai==1.51.0
 python-dotenv==1.0.1
 aiohttp==3.10.5
 duckduckgo-search==6.3.7
