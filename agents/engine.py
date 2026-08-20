@@ -202,12 +202,13 @@ class AgentEngine:
                 self.history = self.history[:history_checkpoint + 1]
 
             except APIStatusError as e:
-                # 529 = overload на OpenRouter
-                if e.status_code in (429, 529, 503):
-                    logger.warning(f"⚠️ Перегрузка модели {model} (код {e.status_code}), переключаюсь...")
+                # 404 = модель недоступна/платная
+                # 429 = лимит, 529/503 = перегрузка
+                if e.status_code in (404, 429, 529, 503):
+                    logger.warning(f"⚠️ Модель {model} недоступна (код {e.status_code}), переключаюсь...")
                     next_m = self._next_model()
                     if next_m is None:
-                        return "❌ Все модели перегружены. Попробуй чуть позже.", model
+                        return "❌ Все модели недоступны. Попробуй позже.", model
                     self.history = self.history[:history_checkpoint + 1]
                 else:
                     raise
