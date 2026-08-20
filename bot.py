@@ -1,0 +1,302 @@
+"""
+Telegram бот с меню агентов.
+Запуск: python bot.py
+"""
+
+import asyncio
+import logging
+import os
+
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode, ChatAction
+
+from agents.definitions import AGENTS
+from agents.engine import AgentManager
+
+load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# ─── Конфигурация ─────────────────────────────────────────────────────────────
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
+ALLOWED_USERS = set(
+    int(u.strip()) for u in ALLOWED_USERS_RAW.split(",") if u.strip().isdigit()
+)
+
+# user_id -> AgentManager
+_managers: dict[int, AgentManager] = {}
+# user_id -> текущий агент
+_active_agent: dict[int, str] = {}
+
+
+# ─── Вспомогательные функции ──────────────────────────────────────────────────
+
+def get_manager(user_id: int) -> AgentManager:
+    if user_id not in _managers:
+        _managers[user_id] = AgentManager(GEMINI_API_KEY)
+    return _managers[user_id]
+
+
+def is_allowed(user_id: int) -> bool:
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+
+
+def agents_keyboard() -> InlineKeyboardMarkup:
+    """Inline-клавиатура для выбора агента."""
+    buttons = []
+    row = []
+    for i, (name, agent) in enumerate(AGENTS.items()):
+        row.append(InlineKeyboardButton(
+            f"{agent.emoji} {agent.display_name}",
+            callback_data=f"agent:{name}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def escape_md(text: str) -> str:
+    """Экранирует символы для MarkdownV2."""
+    chars = r"\_*[]()~`>#+-=|{}.!"
+    for ch in chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+# ─── Хендлеры команд ──────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    text = (
+        f"👋 Привет, *{user.first_name}*!\n\n"
+        "Я — менеджер AI-агентов. Выбери агента для работы:\n\n"
+    )
+    for agent in AGENTS.values():
+        text += f"{agent.emoji} *{agent.display_name}* — {agent.description}\n"
+
+    text += "\nИли используй /agents чтобы выбрать агента."
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=agents_keyboard()
+    )
+
+
+async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню выбора агента."""
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        "🤖 *Выбери агента:*",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=agents_keyboard(),
+    )
+
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает историю текущего агента."""
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+    manager = get_manager(user_id)
+    active = _active_agent.get(user_id)
+    if active:
+        manager.reset_agent(active)
+        await update.message.reply_text(f"🔄 История агента *{AGENTS[active].display_name}* очищена.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        manager.reset_all()
+        await update.message.reply_text("🔄 История всех агентов очищена.")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущего агента."""
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        return
+    active = _active_agent.get(user_id)
+    if active and active in AGENTS:
+        a = AGENTS[active]
+        tools_list = ", ".join(f"`{t}`" for t in a.tools)
+        text = (
+            f"📍 Текущий агент: *{a.emoji} {a.display_name}*\n"
+            f"📝 {a.description}\n"
+            f"🔧 Инструменты: {tools_list}"
+        )
+    else:
+        text = "❌ Агент не выбран. Используй /agents"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Справка по командам."""
+    if not is_allowed(update.effective_user.id):
+        return
+    text = (
+        "📖 *Команды:*\n\n"
+        "/start — Начать работу\n"
+        "/agents — Выбрать агента\n"
+        "/status — Текущий агент\n"
+        "/reset — Очистить историю\n"
+        "/help — Эта справка\n\n"
+        "💡 *Как пользоваться:*\n"
+        "1. Выбери агента через /agents\n"
+        "2. Пиши задачи обычным текстом\n"
+        "3. Агент сам использует нужные инструменты\n\n"
+        "🤖 *Агенты:*\n"
+    )
+    for a in AGENTS.values():
+        text += f"{a.emoji} *{a.display_name}* — {a.description}\n"
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# ─── Callback: выбор агента ───────────────────────────────────────────────────
+
+async def on_agent_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_allowed(user_id):
+        return
+
+    agent_name = query.data.split(":", 1)[1]
+    if agent_name not in AGENTS:
+        await query.edit_message_text("❌ Агент не найден.")
+        return
+
+    _active_agent[user_id] = agent_name
+    agent = AGENTS[agent_name]
+
+    await query.edit_message_text(
+        f"{agent.emoji} *{agent.display_name}* выбран!\n\n"
+        f"_{agent.description}_\n\n"
+        f"Пиши задачу, и я приступлю к работе.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ─── Хендлер сообщений ────────────────────────────────────────────────────────
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    active = _active_agent.get(user_id)
+    if not active:
+        await update.message.reply_text(
+            "⚠️ Сначала выбери агента через /agents или кнопку ниже.",
+            reply_markup=agents_keyboard(),
+        )
+        return
+
+    agent = AGENTS[active]
+    manager = get_manager(user_id)
+    engine = manager.get_engine(active)
+
+    # Показываем "печатает..."
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    user_text = update.message.text.strip()
+    logger.info(f"User {user_id} -> [{agent.name}]: {user_text[:80]}")
+
+    try:
+        # Запускаем агента
+        answer = await engine.process(user_text)
+
+        # Отправляем ответ (разбиваем если длинный)
+        header = f"{agent.emoji} *{agent.display_name}:*\n\n"
+        full = header + answer
+
+        # Telegram лимит: 4096 символов
+        if len(full) <= 4096:
+            await update.message.reply_text(
+                full,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            # Шлём по частям
+            await update.message.reply_text(header[:-2], parse_mode=ParseMode.MARKDOWN)
+            for i in range(0, len(answer), 4000):
+                chunk = answer[i:i+4000]
+                await update.message.reply_text(chunk)
+
+    except Exception as e:
+        logger.error(f"Error processing message: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Ошибка агента: `{str(e)[:200]}`\n\nПопробуй снова или /reset",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ─── Запуск ───────────────────────────────────────────────────────────────────
+
+async def post_init(app: Application):
+    """Регистрирует команды в меню Telegram."""
+    await app.bot.set_my_commands([
+        BotCommand("start", "Начать работу"),
+        BotCommand("agents", "Выбрать агента"),
+        BotCommand("status", "Текущий агент"),
+        BotCommand("reset", "Очистить историю"),
+        BotCommand("help", "Справка"),
+    ])
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в .env")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY не задан в .env")
+
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("agents", cmd_agents))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("help", cmd_help))
+
+    # Выбор агента через inline-кнопки
+    app.add_handler(CallbackQueryHandler(on_agent_select, pattern=r"^agent:"))
+
+    # Обычные сообщения
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
+    logger.info("🚀 Бот запущен! Нажмите Ctrl+C для остановки.")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
