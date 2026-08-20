@@ -95,7 +95,7 @@ class AgentEngine:
 
         self.definition = definition
         self.model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-1.5-pro",
             system_instruction=definition.system_prompt,
             tools=tools if tools else None,
         )
