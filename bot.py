@@ -6,6 +6,8 @@ Telegram бот с webhook-режимом для деплоя на Render (бе�
 import asyncio
 import logging
 import os
+import aiohttp
+from aiohttp import web as aiohttp_web
 
 from dotenv import load_dotenv
 from telegram import (
@@ -279,6 +281,23 @@ def main():
         # ── Webhook режим (Render, production) ──
         webhook_url = f"{RENDER_URL}/{TELEGRAM_TOKEN}"
         logger.info(f"🚀 Запуск в webhook-режиме на порту {PORT}")
+
+        # Keepalive: пингуем себя каждые 10 минут чтобы не засыпать
+        async def keepalive():
+            await asyncio.sleep(60)  # ждём старта
+            async with aiohttp.ClientSession() as session:
+                while True:
+                    try:
+                        await session.get(f"{RENDER_URL}/health", timeout=aiohttp.ClientTimeout(total=10))
+                        logger.info("💓 Keepalive ping sent")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(600)  # каждые 10 минут
+
+        # /health endpoint для ping-а
+        async def health_handler(request):
+            return aiohttp_web.Response(text="OK")
+
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
