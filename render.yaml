@@ -10,7 +10,7 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_MODEL
-        value: deepseek/deepseek-chat-v3-0324:free
+        value: meta-llama/llama-3.3-70b-instruct:free
       - key: PYTHON_VERSION
         value: 3.12.7
     autoDeploy: true

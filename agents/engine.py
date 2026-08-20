@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 # Если текущая модель упёрлась в лимит — автоматически берётся следующая
 
 FALLBACK_MODELS = [
-    "deepseek/deepseek-chat-v3-0324:free",   # 1. DeepSeek V3 (основная)
-    "meta-llama/llama-3.3-70b-instruct:free", # 2. Llama 3.3 70B
-    "deepseek/deepseek-r1:free",              # 3. DeepSeek R1
-    "google/gemini-flash-1.5:free",           # 4. Gemini Flash
-    "mistralai/mistral-7b-instruct:free",     # 5. Mistral 7B (запасной)
+    "meta-llama/llama-3.3-70b-instruct:free",  # 1. Llama 3.3 70B (основная)
+    "deepseek/deepseek-r1:free",                # 2. DeepSeek R1 (думающая)
+    "google/gemini-2.0-flash-exp:free",         # 3. Gemini 2.0 Flash
+    "qwen/qwen3-235b-a22b:free",                # 4. Qwen 235B
+    "mistralai/mistral-7b-instruct:free",       # 5. Mistral 7B (запасной)
 ]
 
 
@@ -124,7 +124,7 @@ def get_tools_for_agent(agent_tools: list[str]) -> list[dict]:
 # ─── Движок агента ────────────────────────────────────────────────────────────
 
 # Бесплатные модели OpenRouter (хорошее соотношение цена/качество)
-DEFAULT_MODEL = "deepseek/deepseek-chat-v3-0324:free"
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 class AgentEngine:
     """Движок одного агента: управляет диалогом и вызовами инструментов."""
