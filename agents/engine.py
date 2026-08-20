@@ -21,10 +21,10 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 FALLBACK_MODELS = [
     "llama-3.3-70b-versatile",  # 1. Llama 3.3 70B (основная)
-    "llama-3.1-70b-versatile",  # 2. Llama 3.1 70B
-    "mixtral-8x7b-32768",       # 3. Mixtral 8x7B
+    "llama3-70b-8192",          # 2. Llama 3 70B (стабильная)
+    "gemma2-9b-it",             # 3. Gemma 2 9B
     "llama-3.1-8b-instant",     # 4. Llama 8B (быстрая)
-    "gemma2-9b-it",             # 5. Gemma 2 9B (резервная)
+    "llama3-8b-8192",           # 5. Llama 3 8B (резервная)
 ]
 
 DEFAULT_MODEL = FALLBACK_MODELS[0]
@@ -242,7 +242,7 @@ class AgentEngine:
             except RuntimeError as e:
                 err = str(e)
                 # Лимит или перегрузка — переключаемся
-                if any(code in err for code in ("HTTP 429", "HTTP 503", "HTTP 529", "HTTP 404", "rate_limit")):
+                if any(code in err for code in ("HTTP 400", "HTTP 429", "HTTP 503", "HTTP 529", "HTTP 404", "rate_limit", "decommissioned")):
                     logger.warning(f"⚠️ Модель {model} недоступна: {err[:80]}, переключаюсь...")
                     next_m = self._next_model()
                     if next_m is None:
