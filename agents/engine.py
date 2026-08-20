@@ -1,5 +1,5 @@
 """
-Движок агента: общается с OpenRouter (OpenAI-совместимый API),
+Движок агента: общается с Groq API,
 вызывает инструменты, хранит историю диалога.
 При превышении лимита автоматически переключается на следующую модель.
 """
@@ -9,26 +9,28 @@ import json
 import logging
 from typing import Optional
 
-from openai import AsyncOpenAI, RateLimitError, APIStatusError
+from groq import AsyncGroq, RateLimitError, APIStatusError
 
 from agents.definitions import AgentDefinition, AGENTS
 from tools.tools import TOOLS_REGISTRY
 
 logger = logging.getLogger(__name__)
 
-# ─── Цепочка фоллбэк-моделей ─────────────────────────────────────────────────
-# Если текущая модель упёрлась в лимит — автоматически берётся следующая
+# ─── Цепочка фоллбэк-моделей (Groq) ─────────────────────────────────────────
+# Бесплатно, быстро, без карты — просто зарегистрируйся на console.groq.com
 
 FALLBACK_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",  # 1. Llama 3.3 70B (основная)
-    "deepseek/deepseek-r1:free",                # 2. DeepSeek R1 (думающая)
-    "google/gemini-2.0-flash-exp:free",         # 3. Gemini 2.0 Flash
-    "qwen/qwen3-235b-a22b:free",                # 4. Qwen 235B
-    "mistralai/mistral-7b-instruct:free",       # 5. Mistral 7B (запасной)
+    "llama-3.3-70b-versatile",   # 1. Llama 3.3 70B (основная, мощная)
+    "llama-3.1-70b-versatile",   # 2. Llama 3.1 70B (запасная)
+    "mixtral-8x7b-32768",        # 3. Mixtral 8x7B (большой контекст)
+    "llama-3.1-8b-instant",      # 4. Llama 3.1 8B (быстрая)
+    "gemma2-9b-it",              # 5. Gemma 2 9B (резервная)
 ]
 
+DEFAULT_MODEL = FALLBACK_MODELS[0]
 
-# ─── Схемы инструментов (OpenAI function calling формат) ──────────────────────
+
+# ─── Схемы инструментов (OpenAI-совместимый формат) ──────────────────────────
 
 TOOL_SCHEMAS = [
     {
@@ -116,56 +118,46 @@ TOOL_SCHEMAS = [
     },
 ]
 
-# Фильтруем схемы по списку инструментов агента
+
 def get_tools_for_agent(agent_tools: list[str]) -> list[dict]:
     return [t for t in TOOL_SCHEMAS if t["function"]["name"] in agent_tools]
 
 
 # ─── Движок агента ────────────────────────────────────────────────────────────
 
-# Бесплатные модели OpenRouter (хорошее соотношение цена/качество)
-DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
-
 class AgentEngine:
     """Движок одного агента: управляет диалогом и вызовами инструментов."""
 
     def __init__(self, definition: AgentDefinition, api_key: str, model: str = DEFAULT_MODEL):
         self.definition = definition
-        self.client = AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-        )
+        self.client = AsyncGroq(api_key=api_key)
         self.tools = get_tools_for_agent(definition.tools)
         self.history: list[dict] = [
             {"role": "system", "content": definition.system_prompt}
         ]
         self._max_tool_calls = 8
 
-        # Фоллбэк: строим цепочку начиная с выбранной модели
+        # Строим цепочку фоллбэка начиная с выбранной модели
         if model in FALLBACK_MODELS:
             start = FALLBACK_MODELS.index(model)
             self._model_chain = FALLBACK_MODELS[start:] + FALLBACK_MODELS[:start]
         else:
-            # Пользовательская модель — ставим первой, потом стандартные
             self._model_chain = [model] + FALLBACK_MODELS
 
-        self._model_index = 0  # индекс текущей активной модели
+        self._model_index = 0
 
     @property
     def current_model(self) -> str:
         return self._model_chain[self._model_index]
 
     def _next_model(self) -> Optional[str]:
-        """Переключается на следующую модель. Возвращает None если все исчерпаны."""
         self._model_index += 1
         if self._model_index >= len(self._model_chain):
             self._model_index = len(self._model_chain) - 1
             return None
         return self._model_chain[self._model_index]
 
-
     async def _call_tool(self, name: str, args: dict) -> str:
-        """Вызывает инструмент по имени."""
         fn = TOOLS_REGISTRY.get(name)
         if fn is None:
             return f"❌ Инструмент `{name}` не найден"
@@ -178,16 +170,11 @@ class AgentEngine:
             return f"❌ Ошибка инструмента {name}: {e}"
 
     async def process(self, user_message: str) -> tuple[str, str]:
-        """
-        Обрабатывает сообщение и возвращает (ответ, имя_использованной_модели).
-        При лимите автоматически переключается на следующую модель в цепочке.
-        """
+        """Обрабатывает сообщение, возвращает (ответ, модель)."""
         self.history.append({"role": "user", "content": user_message})
-
-        # Сохраняем точку отката истории (без последнего user-сообщения)
         history_checkpoint = len(self.history) - 1
 
-        for attempt in range(len(self._model_chain)):
+        for _ in range(len(self._model_chain)):
             model = self.current_model
             try:
                 result = await self._run_with_tools(model)
@@ -198,13 +185,10 @@ class AgentEngine:
                 next_m = self._next_model()
                 if next_m is None:
                     return "❌ Все модели достигли лимита. Попробуй позже.", model
-                # Откатываем историю до чекпоинта чтобы не дублировать сообщения
                 self.history = self.history[:history_checkpoint + 1]
 
             except APIStatusError as e:
-                # 404 = модель недоступна/платная
-                # 429 = лимит, 529/503 = перегрузка
-                if e.status_code in (404, 429, 529, 503):
+                if e.status_code in (404, 429, 503, 529):
                     logger.warning(f"⚠️ Модель {model} недоступна (код {e.status_code}), переключаюсь...")
                     next_m = self._next_model()
                     if next_m is None:
@@ -216,7 +200,7 @@ class AgentEngine:
         return "❌ Не удалось получить ответ.", self.current_model
 
     async def _run_with_tools(self, model: str) -> str:
-        """Выполняет один полный цикл запрос → инструменты → ответ."""
+        """Один цикл запрос → инструменты → ответ."""
         for _ in range(self._max_tool_calls):
             response = await self.client.chat.completions.create(
                 model=model,
@@ -247,15 +231,13 @@ class AgentEngine:
         return "⚠️ Агент достиг лимита вызовов инструментов."
 
     def reset(self):
-        """Сбрасывает историю диалога."""
         self.history = [{"role": "system", "content": self.definition.system_prompt}]
+        self._model_index = 0
 
 
 # ─── Менеджер агентов ─────────────────────────────────────────────────────────
 
 class AgentManager:
-    """Менеджер всех агентов для одного пользователя."""
-
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL):
         self.api_key = api_key
         self.model = model

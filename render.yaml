@@ -7,10 +7,10 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: OPENROUTER_API_KEY
+      - key: GROQ_API_KEY
         sync: false
-      - key: OPENROUTER_MODEL
-        value: meta-llama/llama-3.3-70b-instruct:free
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
       - key: PYTHON_VERSION
         value: 3.12.7
     autoDeploy: true

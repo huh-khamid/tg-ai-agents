@@ -39,8 +39,8 @@ logger = logging.getLogger(__name__)
 # ─── Конфигурация ─────────────────────────────────────────────────────────────
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USERS", "")
 ALLOWED_USERS = set(
     int(u.strip()) for u in ALLOWED_USERS_RAW.split(",") if u.strip().isdigit()
@@ -60,7 +60,7 @@ _active_agent: dict[int, str] = {}
 
 def get_manager(user_id: int) -> AgentManager:
     if user_id not in _managers:
-        _managers[user_id] = AgentManager(OPENROUTER_API_KEY, OPENROUTER_MODEL)
+        _managers[user_id] = AgentManager(GROQ_API_KEY, GROQ_MODEL)
     return _managers[user_id]
 
 
@@ -266,8 +266,8 @@ async def post_init(app: Application):
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в .env")
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY не задан в .env")
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY не задан в .env")
 
     app = (
         Application.builder()
