@@ -318,4 +318,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # Python 3.14 убрал авто-создание event loop через get_event_loop()
+    # Создаём его вручную перед запуском
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     main()
